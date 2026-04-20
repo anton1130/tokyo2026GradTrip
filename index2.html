@@ -1,0 +1,411 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>東京 7D6N 雲端同步行程 App</title>
+    <!-- Firebase SDK -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, onSnapshot, setDoc, updateDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Firebase 配置 (由環境自動注入)
+        const firebaseConfig = JSON.parse(__firebase_config);
+        const app = initializeApp(firebaseConfig);
+        const auth = getAuth(app);
+        const db = getFirestore(app);
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'tokyo-trip-default';
+
+        // 取得網址中的 Room ID，若無則產生一個預設的
+        const urlParams = new URLSearchParams(window.location.search);
+        let roomId = urlParams.get('room') || 'tokyo-main-group';
+
+        window.currentRoom = roomId;
+
+        // 全域資料與渲染函數
+        let tripData = [];
+        let packingData = [];
+        let hotelData = [];
+        let headerData = { title: "TOKYO TRIP 2026", subtitle: "5月6日 — 5月14日", rate: "0.051" };
+        let user = null;
+
+        // 初始化驗證
+        const initAuth = async () => {
+            if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                await signInWithCustomToken(auth, __initial_auth_token);
+            } else {
+                await signInAnonymously(auth);
+            }
+        };
+
+        initAuth();
+
+        onAuthStateChanged(auth, (u) => {
+            user = u;
+            if (user) {
+                startSync();
+                document.getElementById('room-display').innerText = `目前房號：${roomId}`;
+            }
+        });
+
+        // 監聽雲端資料變動 (核心同步邏輯)
+        function startSync() {
+            const docRef = doc(db, 'artifacts', appId, 'public', 'data', roomId);
+
+            onSnapshot(docRef, (snapshot) => {
+                if (snapshot.exists()) {
+                    const data = snapshot.data();
+                    tripData = data.tripData || [];
+                    packingData = data.packingData || [];
+                    hotelData = data.hotelData || [];
+                    headerData = data.headerData || headerData;
+
+                    // 同步後重新渲染畫面
+                    updateHeaderUI();
+                    renderItinerary();
+                    renderPacking();
+                    renderHotels();
+                    convertCurrency('jpy');
+                } else {
+                    // 若無資料則初始化一份
+                    saveToCloud(true);
+                }
+            }, (err) => {
+                console.error("同步失敗:", err);
+            });
+        }
+
+        // 儲存至雲端
+        async function saveToCloud(isInit = false) {
+            if (!user) return;
+            const docRef = doc(db, 'artifacts', appId, 'public', 'data', roomId);
+            const payload = {
+                tripData: tripData,
+                packingData: packingData,
+                hotelData: hotelData,
+                headerData: headerData,
+                lastUpdated: new Date().getTime()
+            };
+            try {
+                await setDoc(docRef, payload, { merge: true });
+            } catch (e) {
+                console.error("儲存失敗", e);
+            }
+        }
+
+        // 全域導出功能
+        window.saveHeader = () => {
+            headerData.title = document.getElementById('trip-title').innerText;
+            headerData.subtitle = document.getElementById('trip-subtitle').innerText;
+            headerData.rate = document.getElementById('rate-hkd').innerText;
+            saveToCloud();
+        };
+
+        window.updateEvent = (d, e, f, v) => { tripData[d].events[e][f] = v; saveToCloud(); };
+        window.updateDayTheme = (d, v) => { tripData[d].theme = v; saveToCloud(); };
+        window.addEvent = (d) => { tripData[d].events.push({time:"12:00", activity:"新行程", detail:"", link:""}); saveToCloud(); };
+        window.deleteEvent = (d, e) => { if(confirm("確定刪除？")) { tripData[d].events.splice(e,1); saveToCloud(); } };
+        window.moveEvent = (d, e, dir) => {
+            const events = tripData[d].events;
+            const newPos = e + dir;
+            if (newPos < 0 || newPos >= events.length) return;
+            [events[e], events[newPos]] = [events[newPos], events[e]];
+            saveToCloud();
+        };
+
+        window.togglePacking = (c, i) => {
+            packingData[window.activeUserIndex].list[c].items[i].checked = !packingData[window.activeUserIndex].list[c].items[i].checked;
+            saveToCloud();
+        };
+        window.addPackingItem = (c) => { packingData[window.activeUserIndex].list[c].items.push({text:"新物品", checked:false}); saveToCloud(); };
+        window.updatePackingItem = (c, i, v) => { packingData[window.activeUserIndex].list[c].items[i].text = v; saveToCloud(); };
+
+        window.shareRoom = () => {
+            const url = window.location.href.split('?')[0] + '?room=' + roomId;
+            const tempInput = document.createElement('input');
+            document.body.appendChild(tempInput);
+            tempInput.value = url;
+            tempInput.select();
+            document.execCommand('copy');
+            document.body.removeChild(tempInput);
+            alert("同步連結已複製！傳給朋友打開即可共同編輯。\n連結：" + url);
+        };
+
+        // 渲染 UI 函數
+        function updateHeaderUI() {
+            document.getElementById('trip-title').innerText = headerData.title;
+            document.getElementById('trip-subtitle').innerText = headerData.subtitle;
+            document.getElementById('rate-hkd').innerText = headerData.rate;
+        }
+
+        function renderItinerary() {
+            const container = document.getElementById('itinerary-container');
+            const dayNav = document.getElementById('day-nav');
+            if(!container || !dayNav) return;
+            container.innerHTML = ''; dayNav.innerHTML = '';
+
+            tripData.forEach((day, dIdx) => {
+                const btn = document.createElement('button');
+                btn.className = `day-btn ${dIdx === 0 ? 'active' : ''}`;
+                btn.innerText = dIdx === 0 ? 'Day 0' : `Day ${dIdx}`;
+                btn.onclick = () => scrollToDay(dIdx, btn);
+                dayNav.appendChild(btn);
+
+                const daySec = document.createElement('div');
+                daySec.className = 'day-group';
+                daySec.id = `day-sec-${dIdx}`;
+                daySec.innerHTML = `
+                    <div class="day-title-wrapper">
+                        <span class="day-label">${dIdx === 0 ? 'Day 0' : 'Day ' + dIdx}</span>
+                        <span class="day-theme" contenteditable="true" onblur="window.updateDayTheme(${dIdx}, this.innerText)">${day.theme}</span>
+                    </div>
+                    <div class="smart-timeline">
+                        ${day.events.map((ev, eIdx) => `
+                            <div class="timeline-item">
+                                <div class="item-time" contenteditable="true" onblur="window.updateEvent(${dIdx}, ${eIdx}, 'time', this.innerText)">${ev.time}</div>
+                                <div class="item-node"></div>
+                                <div class="item-content">
+                                    <div class="item-controls">
+                                        <button class="control-btn" onclick="window.moveEvent(${dIdx}, ${eIdx}, -1)">↑</button>
+                                        <button class="control-btn" onclick="window.moveEvent(${dIdx}, ${eIdx}, 1)">↓</button>
+                                        <button class="control-btn del-btn" onclick="window.deleteEvent(${dIdx}, ${eIdx})">×</button>
+                                    </div>
+                                    <div class="activity-name" contenteditable="true" onblur="window.updateEvent(${dIdx}, ${eIdx}, 'activity', this.innerText)">${ev.activity}</div>
+                                    <div class="activity-detail" contenteditable="true" onblur="window.updateEvent(${dIdx}, ${eIdx}, 'detail', this.innerText)">${ev.detail}</div>
+                                </div>
+                            </div>
+                        `).join('')}
+                        <button class="add-btn-minimal" onclick="window.addEvent(${dIdx})">＋ 新增行程</button>
+                    </div>
+                `;
+                container.appendChild(daySec);
+            });
+        }
+
+        function renderPacking() {
+            const container = document.getElementById('packing-container');
+            if(!container || !packingData[window.activeUserIndex]) return;
+            container.innerHTML = '';
+            packingData[window.activeUserIndex].list.forEach((cat, cIdx) => {
+                const card = document.createElement('div');
+                card.className = 'card';
+                card.innerHTML = `
+                    <div style="font-weight:900; margin-bottom:10px; color:var(--accent-green)">${cat.category}</div>
+                    ${cat.items.map((item, iIdx) => `
+                        <div class="packing-item ${item.checked ? 'checked' : ''}">
+                            <input type="checkbox" ${item.checked ? 'checked' : ''} onchange="window.togglePacking(${cIdx}, ${iIdx})">
+                            <div class="packing-text" contenteditable="true" onblur="window.updatePackingItem(${cIdx}, ${iIdx}, this.innerText)">${item.text}</div>
+                        </div>
+                    `).join('')}
+                    <button class="add-btn-minimal" onclick="window.addPackingItem(${cIdx})">＋ 新增物品</button>
+                `;
+                container.appendChild(card);
+            });
+        }
+
+        function renderHotels() {
+            const container = document.getElementById('hotel-container');
+            if(!container) return;
+            container.innerHTML = hotelData.map((h, idx) => `
+                <div class="card">
+                    <div style="font-weight:800">${h.name}</div>
+                    <div style="font-size:0.8rem; color:gray">${h.checkin} - ${h.checkout}</div>
+                    <div style="font-size:0.85rem">${h.note}</div>
+                </div>
+            `).join('') || '<p style="color:gray;text-align:center">尚未新增住宿資訊</p>';
+        }
+
+        // 初始化預設資料 (供第一次進入時使用)
+        tripData = [
+            { day: 1, theme: "東京抵達", events: [{ time: "09:00", activity: "抵達成田機場", detail: "領取行李", link: "" }] },
+            { day: 2, theme: "市區巡禮", events: [{ time: "10:00", activity: "淺草寺", detail: "參拜", link: "" }] }
+        ];
+        packingData = [
+            { name: "旅客 1", list: [{ category: "必備品", items: [{ text: "護照", checked: false }] }] },
+            { name: "旅客 2", list: [{ category: "必備品", items: [{ text: "護照", checked: false }] }] },
+            { name: "旅客 3", list: [{ category: "必備品", items: [{ text: "護照", checked: false }] }] },
+            { name: "旅客 4", list: [{ category: "必備品", items: [{ text: "護照", checked: false }] }] }
+        ];
+        hotelData = [{ name: "東京第一飯店", checkin: "5/7", checkout: "5/13", note: "近銀座站" }];
+
+    </script>
+    <style>
+        :root {
+            --primary-color: #ef4444;
+            --secondary-color: #fca5a5;
+            --bg-color: #f8fafc;
+            --card-bg: #ffffff;
+            --text-main: #0f172a;
+            --text-sub: #64748b;
+            --accent-blue: #3b82f6;
+            --accent-green: #10b981;
+            --accent-orange: #f59e0b;
+            --timeline-line: #e2e8f0;
+        }
+
+        * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; outline: none; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Noto Sans TC", sans-serif;
+            margin: 0; padding-bottom: 130px; background-color: var(--bg-color); color: var(--text-main);
+        }
+
+        .hero-section {
+            background: linear-gradient(135deg, #1e293b 0%, #334155 100%);
+            color: white; padding: 40px 20px 30px; text-align: left;
+            border-bottom-left-radius: 32px; border-bottom-right-radius: 32px;
+        }
+        .share-banner {
+            background: rgba(255,255,255,0.1); padding: 12px; border-radius: 12px;
+            margin-top: 15px; display: flex; justify-content: space-between; align-items: center;
+            font-size: 0.85rem; backdrop-filter: blur(5px);
+        }
+        .share-btn { background: var(--accent-blue); color: white; border: none; padding: 6px 12px; border-radius: 8px; font-weight: 700; cursor: pointer; }
+
+        header {
+            background: white; padding: 20px; text-align: center; margin: -20px 20px 0;
+            border-radius: 20px; box-shadow: 0 8px 20px rgba(0,0,0,0.06); position: relative; z-index: 10;
+        }
+        header h1 { margin: 0; font-size: 1.2rem; color: var(--primary-color); }
+
+        .nav-container {
+            position: fixed; bottom: 0; width: 100%; z-index: 100;
+            background: rgba(255, 255, 255, 0.95); backdrop-filter: blur(10px);
+            border-top: 1px solid #eee; padding-bottom: env(safe-area-inset-bottom);
+        }
+        .main-nav { display: flex; justify-content: space-around; padding: 10px; }
+        .nav-item { border: none; background: none; color: #94a3b8; font-size: 0.75rem; display: flex; flex-direction: column; align-items: center; flex: 1; }
+        .nav-item.active { color: var(--primary-color); font-weight: 800; }
+
+        .day-nav { display: flex; gap: 8px; overflow-x: auto; padding: 10px; border-bottom: 1px solid #f1f5f9; }
+        .day-btn { padding: 6px 15px; background: #f1f5f9; border-radius: 15px; border: none; font-size: 0.8rem; flex-shrink: 0; }
+        .day-btn.active { background: var(--primary-color); color: white; }
+
+        .content-section { display: none; padding: 20px; }
+        .content-section.active { display: block; }
+
+        .day-group { margin-bottom: 30px; }
+        .day-title-wrapper { border-left: 4px solid var(--primary-color); padding-left: 10px; margin-bottom: 15px; }
+        .smart-timeline { position: relative; padding-left: 20px; }
+        .smart-timeline::before { content: ''; position: absolute; left: 65px; top: 0; bottom: 0; width: 2px; background: var(--timeline-line); }
+
+        .timeline-item { display: flex; gap: 15px; margin-bottom: 20px; }
+        .item-time { width: 65px; font-size: 0.75rem; font-weight: 800; color: var(--primary-color); text-align: right; padding-top: 12px; flex-shrink: 0; }
+        .item-node { width: 10px; height: 10px; border-radius: 50%; background: white; border: 2px solid var(--primary-color); margin-top: 15px; position: relative; z-index: 2; margin-left: -5px; flex-shrink: 0; }
+        .item-content { flex: 1; background: white; padding: 12px 15px; border-radius: 15px; box-shadow: 0 2px 8px rgba(0,0,0,0.03); position: relative; }
+
+        .item-controls { position: absolute; top: 8px; right: 8px; display: flex; gap: 4px; }
+        .control-btn { width: 22px; height: 22px; border-radius: 4px; border: none; background: #f1f5f9; font-size: 10px; cursor: pointer; }
+        .del-btn { background: #fee2e2; color: #ef4444; }
+
+        .activity-name { font-weight: 800; font-size: 0.95rem; margin-bottom: 4px; padding-right: 50px; }
+        .activity-detail { font-size: 0.8rem; color: var(--text-sub); }
+
+        .add-btn-minimal { width: 100%; padding: 10px; border: 1px dashed #ddd; border-radius: 12px; background: none; color: #888; font-size: 0.85rem; margin-top: 10px; }
+        .card { background: white; border-radius: 15px; padding: 15px; margin-bottom: 15px; box-shadow: 0 2px 10px rgba(0,0,0,0.02); }
+
+        .packing-item { display: flex; align-items: center; margin-bottom: 8px; }
+        .packing-item input { margin-right: 10px; width: 18px; height: 18px; }
+        .packing-item.checked .packing-text { text-decoration: line-through; color: #ccc; }
+
+        .user-tabs { display: flex; gap: 8px; overflow-x: auto; margin-bottom: 15px; }
+        .user-tab { padding: 6px 15px; background: white; border: 1px solid #eee; border-radius: 10px; font-size: 0.8rem; white-space: nowrap; }
+        .user-tab.active { border-color: var(--accent-green); color: var(--accent-green); font-weight: 800; }
+    </style>
+</head>
+<body>
+
+<div class="hero-section">
+    <div id="current-date" style="font-size:0.8rem; opacity:0.8">載入中...</div>
+    <div style="font-size:1.5rem; font-weight:900">📍 東京雲端同步行程</div>
+    <div class="share-banner">
+        <span id="room-display">連線中...</span>
+        <button class="share-btn" onclick="window.shareRoom()">🔗 分享連結</button>
+    </div>
+</div>
+
+<header>
+    <h1 id="trip-title" contenteditable="true" onblur="window.saveHeader()">TOKYO TRIP 2026</h1>
+    <p id="trip-subtitle" contenteditable="true" onblur="window.saveHeader()">多人即時編輯模式</p>
+</header>
+
+<div class="nav-container">
+    <div id="day-nav" class="day-nav"></div>
+    <div class="main-nav">
+        <button class="nav-item active" onclick="showSection('days', this)">📅 行程</button>
+        <button class="nav-item" onclick="showSection('transport', this)">🏨 住宿/匯率</button>
+        <button class="nav-item" onclick="showSection('packing', this)">🎒 清單</button>
+    </div>
+</div>
+
+<div id="days" class="content-section active">
+    <div id="itinerary-container"></div>
+</div>
+
+<div id="transport" class="content-section">
+    <div style="font-weight:900; margin-bottom:10px">🏨 住宿詳情</div>
+    <div id="hotel-container"></div>
+    <div class="card" style="margin-top:20px">
+        <div style="font-weight:900; margin-bottom:10px">💱 匯率計數</div>
+        <div style="display:flex; align-items:center; gap:10px; margin-bottom:10px">
+            <input type="number" id="jpy-input" value="1000" style="flex:1; padding:8px; border-radius:8px; border:1px solid #ddd" oninput="convertCurrency('jpy')">
+            <span>JPY ¥</span>
+        </div>
+        <div style="display:flex; align-items:center; gap:10px">
+            <input type="number" id="hkd-input" style="flex:1; padding:8px; border-radius:8px; border:1px solid #ddd" oninput="convertCurrency('hkd')">
+            <span>HKD $</span>
+        </div>
+        <p style="font-size:0.7rem; color:gray; margin-top:8px">1 JPY = <span contenteditable="true" id="rate-hkd" onblur="window.saveHeader()">0.051</span> HKD</p>
+    </div>
+</div>
+
+<div id="packing" class="content-section">
+    <div class="user-tabs">
+        <button class="user-tab active" onclick="switchUser(0, this)">👤 旅客 1</button>
+        <button class="user-tab" onclick="switchUser(1, this)">👤 旅客 2</button>
+        <button class="user-tab" onclick="switchUser(2, this)">👤 旅客 3</button>
+        <button class="user-tab" onclick="switchUser(3, this)">👤 旅客 4</button>
+    </div>
+    <div id="packing-container"></div>
+</div>
+
+<script>
+    // 基本 UI 邏輯
+    window.activeUserIndex = 0;
+
+    function showSection(id, btn) {
+        document.querySelectorAll('.content-section').forEach(s => s.classList.remove('active'));
+        document.getElementById(id).classList.add('active');
+        document.querySelectorAll('.nav-item').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        document.getElementById('day-nav').style.display = (id === 'days') ? 'flex' : 'none';
+        window.scrollTo(0,0);
+    }
+
+    function switchUser(idx, btn) {
+        window.activeUserIndex = idx;
+        document.querySelectorAll('.user-tab').forEach(t => t.classList.remove('active'));
+        btn.classList.add('active');
+        // renderPacking 會由 Firestore 監聽器觸發，或手動調用
+        if (typeof renderPacking === 'function') renderPacking();
+    }
+
+    function scrollToDay(idx, btn) {
+        const el = document.getElementById(`day-sec-${idx}`);
+        if(el) window.scrollTo({ top: el.offsetTop - 140, behavior: "smooth" });
+        document.querySelectorAll('.day-btn').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+    }
+
+    function convertCurrency(source) {
+        const rate = parseFloat(document.getElementById('rate-hkd').innerText) || 0.051;
+        const jpy = document.getElementById('jpy-input');
+        const hkd = document.getElementById('hkd-input');
+        if (source === 'jpy') hkd.value = (parseFloat(jpy.value || 0) * rate).toFixed(2);
+        else jpy.value = (parseFloat(hkd.value || 0) / rate).toFixed(0);
+    }
+
+    document.getElementById('current-date').innerText = new Date().toLocaleDateString('zh-HK', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
+</script>
+</body>
+</html>
